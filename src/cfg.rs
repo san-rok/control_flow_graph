@@ -7,6 +7,13 @@ use std::collections::BTreeMap;
 
 use crate::binary::*;
 
+// parallel reading the blocks of cfg
+use std::sync::mpsc;
+use std::thread;
+
+// shared state concurrency
+use std::sync::{Arc, Mutex};
+
 // Basic Block: consecutive instructions up until the first jump
 #[derive(Clone, Debug)]
 pub struct BasicBlock {
@@ -39,6 +46,8 @@ impl PartialOrd for BasicBlock {
 ///////////////////////////////////////////////////////////////
 
 impl BasicBlock {
+    // given a binary instance it reads a basic block from the given virtual address
+    // or if its not a valid virtual address, then from the closest(?) to that address
     fn from_address(binary: &Binary, va: u64) -> Self {
         let mut bb: BasicBlock = BasicBlock {
             address: va,
@@ -261,6 +270,74 @@ pub struct ControlFlowGraph {
 }
 
 impl ControlFlowGraph {
+
+    // https://stackoverflow.com/questions/75000029/reading-a-vector-from-multiple-threads
+
+    pub fn parallel_from_address(binary: &Binary, va: u64) -> Self {
+        let (tx, rx) = mpsc::channel();
+
+        let addresses = Arc::new(Mutex::new(Vec::new()));
+
+        let mut handles = vec![];
+
+        // let mut addresses: Vec<u64> = Vec::new();
+
+        addresses.lock().unwrap().push(va);
+
+        while let Some(address) = addresses.lock().unwrap().pop() {
+            let adrs = Arc::clone(&addresses);
+            let cx = tx.clone();
+            let handle = thread::spawn(move || {
+                    let bb = BasicBlock::from_address(binary, address);
+                    let mut targets = bb.targets().to_vec();
+
+                    cx.send(bb).unwrap();
+
+                    while let Some(target) = targets.pop() {
+                        let mut address = adrs.lock().unwrap();
+                        if !address.contains(&target) {
+                            address.push(target);
+                        }
+                    }
+                });
+            
+            handles.push(handle);
+            /*
+            thread::spawn( move || {
+                let bb = BasicBlock::from_address(binary, address);
+                let mut targets = bb.targets().to_vec();
+
+                cx.send(bb).unwrap();
+
+                while let Some(target) = targets.pop() {
+                    let mut address = adrs.lock().unwrap();
+                    if !address.contains(&target) {
+                        address.push(target);
+                    }
+                }
+            });
+            */
+        }
+
+        let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
+
+        for recieved in rx {
+            blocks.insert(recieved.address(), recieved);
+        }
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let mut blocks: Vec<BasicBlock> = blocks.into_values().collect::<Vec<BasicBlock>>();
+        blocks.sort();
+
+        ControlFlowGraph {
+            address: va,
+            blocks,
+        }
+    }
+
     // explore control flow graph from a given virtual address (using DFS)
     pub fn from_address(binary: &Binary, va: u64) -> Self {
         let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
