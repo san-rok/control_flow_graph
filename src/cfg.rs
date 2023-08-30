@@ -282,6 +282,8 @@ impl ControlFlowGraph {
 
         // let mut addresses: Vec<u64> = Vec::new();
 
+        // thread::scope - it worked, but never stopped
+
         addresses.lock().unwrap().push(va);
 
         while let Some(address) = addresses.lock().unwrap().pop() {
