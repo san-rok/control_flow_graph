@@ -4,6 +4,7 @@ use std::cmp::*;
 use std::fmt;
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 use crate::binary::*;
 
@@ -13,6 +14,9 @@ use std::thread;
 
 // shared state concurrency
 use std::sync::{Arc, Mutex};
+
+// atomic usize
+use std::sync::atomic::AtomicUsize;
 
 // Basic Block: consecutive instructions up until the first jump
 #[derive(Clone, Debug)]
@@ -270,66 +274,97 @@ pub struct ControlFlowGraph {
 }
 
 impl ControlFlowGraph {
-
-    // https://stackoverflow.com/questions/75000029/reading-a-vector-from-multiple-threads
-
     pub fn parallel_from_address(binary: &Binary, va: u64) -> Self {
         let (tx, rx) = mpsc::channel();
 
-        let addresses = Arc::new(Mutex::new(Vec::new()));
+        // list of block that are subjects of exploration
+        // let addresses = Arc::new(Mutex::new(vec![va]));
+        // list of already explored blocks
+        let visited = Arc::new(Mutex::new(HashSet::<u64>::new()));
 
-        let mut handles = vec![];
+        let (sender, reciever) = mpsc::channel();
 
-        // let mut addresses: Vec<u64> = Vec::new();
+        thread::scope(|s| {
 
-        // thread::scope - it worked, but never stopped
+            sender.send(va).unwrap();
+            // TODO: add atomicusize to count the active threads !!
+            // let active_threads = AtomicUsize::new(1);
+            
+            while let Ok(address) = reciever.try_recv() {
 
-        addresses.lock().unwrap().push(va);
+                let visited_clone = Arc::clone(&visited);
+                // let addresses_clone = Arc::clone(&addresses);
+                let tx_clone = tx.clone();
 
-        while let Some(address) = addresses.lock().unwrap().pop() {
-            let adrs = Arc::clone(&addresses);
-            let cx = tx.clone();
-            let handle = thread::spawn(move || {
+                let sender_clone = sender.clone();
+
+                s.spawn( move || {
+                    println!("1");
+
                     let bb = BasicBlock::from_address(binary, address);
                     let mut targets = bb.targets().to_vec();
+                    println!("the address: {:x}; its targets: {:x?}", bb.address(), bb.targets());
+                    visited_clone.lock().unwrap().insert(bb.address());
 
-                    cx.send(bb).unwrap();
+                    tx_clone.send(bb).unwrap();
+
+                    // let mut adrs = addresses_clone.lock().unwrap();
 
                     while let Some(target) = targets.pop() {
-                        let mut address = adrs.lock().unwrap();
-                        if !address.contains(&target) {
-                            address.push(target);
+                        println!("2");
+                        if !visited_clone.lock().unwrap().contains(&target) {
+                            sender_clone.send(target).unwrap();
+                            // adrs.push(target);
+                            // println!("the addresses to examine: {:x?}", adrs);
                         }
                     }
+
                 });
-            
-            handles.push(handle);
+            }
             /*
-            thread::spawn( move || {
-                let bb = BasicBlock::from_address(binary, address);
-                let mut targets = bb.targets().to_vec();
+            while let Some(address) = addresses.try_lock().unwrap().pop() {
+                println!("1");
 
-                cx.send(bb).unwrap();
+                let visited_clone = Arc::clone(&visited);
+                let addresses_clone = Arc::clone(&addresses);
+                let tx_clone = tx.clone();
 
-                while let Some(target) = targets.pop() {
-                    let mut address = adrs.lock().unwrap();
-                    if !address.contains(&target) {
-                        address.push(target);
+                s.spawn(move || {
+                    let bb = BasicBlock::from_address(binary, address);
+                    let mut targets = bb.targets().to_vec();
+                    println!("the address: {:x}; its targets: {:x?}", bb.address(), bb.targets());
+                    visited_clone.lock().unwrap().insert(bb.address());
+
+                    tx_clone.send(bb).unwrap();
+
+                    let mut adrs = addresses_clone.lock().unwrap();
+
+                    while let Some(target) = targets.pop() {
+                        println!("2");
+                        if !visited_clone.lock().unwrap().contains(&target) {
+                            adrs.push(target);
+                            // println!("the addresses to examine: {:x?}", adrs);
+                        }
                     }
-                }
-            });
+
+                });
+                println!("{:x?}", addresses);
+            }
             */
-        }
-
-        let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
-
-        for recieved in rx {
-            blocks.insert(recieved.address(), recieved);
-        }
-
+        });
+       
+        /*
         for handle in handles {
             handle.join().unwrap();
         }
+        */
+
+        let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
+
+        while let Ok(recieved) = rx.try_recv() {
+            blocks.insert(recieved.address(), recieved);
+        }
+
 
         let mut blocks: Vec<BasicBlock> = blocks.into_values().collect::<Vec<BasicBlock>>();
         blocks.sort();
@@ -464,3 +499,5 @@ impl<'a> dot2::GraphWalk<'a> for ControlFlowGraph {
         t
     }
 }
+
+// https://stackoverflow.com/questions/75000029/reading-a-vector-from-multiple-threads
