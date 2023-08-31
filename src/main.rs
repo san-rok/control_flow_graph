@@ -10,8 +10,10 @@ fn main() {
     // let cfg: ControlFlowGraph = ControlFlowGraph::from_address(&binary, virtual_address);
     let cfg: ControlFlowGraph = ControlFlowGraph::parallel_from_address(&binary, virtual_address);
 
-    let mut f = std::fs::File::create("/home/san-rok/projects/virtual_address/virtual_address.dot")
+    let mut f = std::fs::File::create("/home/san-rok/projects/control_flow_graph/cfgraph.dot")
         .unwrap();
     cfg.render_to(&mut f).unwrap();
-    // dot -Tsvg virtual_address.dot > virtual_address.svg
+    // dot -Tsvg cfgraph.dot > cfgraph.svg
+
+    println!("Hello world!");
 }
