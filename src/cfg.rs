@@ -18,6 +18,9 @@ use std::sync::{Arc, Mutex};
 // atomic usize
 use std::sync::atomic::AtomicUsize;
 
+// ordering types for atomics
+use std::sync::atomic::Ordering::*;
+
 // Basic Block: consecutive instructions up until the first jump
 #[derive(Clone, Debug)]
 pub struct BasicBlock {
@@ -275,96 +278,68 @@ pub struct ControlFlowGraph {
 
 impl ControlFlowGraph {
     pub fn parallel_from_address(binary: &Binary, va: u64) -> Self {
-        let (tx, rx) = mpsc::channel();
+        // channel for building the graph:
+        //          sblock: sending blocks
+        //          rblock: recieving blocks
+        let (sblock, rblock) = mpsc::channel();
 
-        // list of block that are subjects of exploration
-        // let addresses = Arc::new(Mutex::new(vec![va]));
-        // list of already explored blocks
+        // hashset of already explored blocks
         let visited = Arc::new(Mutex::new(HashSet::<u64>::new()));
 
-        let (sender, reciever) = mpsc::channel();
+        // channel for exploring the blocks:
+        //          saddr: sending address subject for exploration
+        //          raddr: recieving address subject for exploration
+        let (saddr, raddr) = mpsc::channel();
 
         thread::scope(|s| {
+            saddr.send(va).unwrap();
 
-            sender.send(va).unwrap();
-            // TODO: add atomicusize to count the active threads !!
-            // let active_threads = AtomicUsize::new(1);
-            
-            while let Ok(address) = reciever.try_recv() {
+            // we must iterate until there are active threads
+            // the number of active threads are counted with this atomicusize
+            let active_threads = Arc::new(AtomicUsize::new(1));
 
-                let visited_clone = Arc::clone(&visited);
-                // let addresses_clone = Arc::clone(&addresses);
-                let tx_clone = tx.clone();
+            // while there are active threads -> we have blocks to explore
+            while active_threads.load(SeqCst) > 0 {
+                // println!("active threads: {}", active_threads.load(SeqCst));
 
-                let sender_clone = sender.clone();
+                if let Ok(address) = raddr.try_recv() {
+                    // clone the senders to move them inside the threads
+                    let sblock_clone = sblock.clone();
+                    let saddr_clone = saddr.clone();
 
-                s.spawn( move || {
-                    println!("1");
+                    // clone the auxiliary dattas to use/modify them inside the threads
+                    let visited_clone = Arc::clone(&visited);
+                    let active_threads_clone = Arc::clone(&active_threads);
 
-                    let bb = BasicBlock::from_address(binary, address);
-                    let mut targets = bb.targets().to_vec();
-                    println!("the address: {:x}; its targets: {:x?}", bb.address(), bb.targets());
-                    visited_clone.lock().unwrap().insert(bb.address());
+                    s.spawn(move || {
+                        // the current thread exploring the basic block: bb (send it on the graph build channel)
+                        // meanwhile the targets of this block is a subject of further exploration (send it on the exploration channel)
+                        let bb = BasicBlock::from_address(binary, address);
+                        let mut targets = bb.targets().to_vec();
+                        // println!("the address: {:x}; its targets: {:x?}", bb.address(), bb.targets());
+                        visited_clone.lock().unwrap().insert(bb.address());
+                        sblock_clone.send(bb).unwrap();
 
-                    tx_clone.send(bb).unwrap();
-
-                    // let mut adrs = addresses_clone.lock().unwrap();
-
-                    while let Some(target) = targets.pop() {
-                        println!("2");
-                        if !visited_clone.lock().unwrap().contains(&target) {
-                            sender_clone.send(target).unwrap();
-                            // adrs.push(target);
-                            // println!("the addresses to examine: {:x?}", adrs);
+                        while let Some(target) = targets.pop() {
+                            if !visited_clone.lock().unwrap().contains(&target) {
+                                // every not yet explored target address increases the number of active threads
+                                active_threads_clone.fetch_add(1, SeqCst);
+                                saddr_clone.send(target).unwrap();
+                            }
                         }
-                    }
 
-                });
+                        // if we explored one block - the corresponding thread will be unactive
+                        active_threads_clone.fetch_sub(1, SeqCst);
+                    });
+                }
             }
-            /*
-            while let Some(address) = addresses.try_lock().unwrap().pop() {
-                println!("1");
-
-                let visited_clone = Arc::clone(&visited);
-                let addresses_clone = Arc::clone(&addresses);
-                let tx_clone = tx.clone();
-
-                s.spawn(move || {
-                    let bb = BasicBlock::from_address(binary, address);
-                    let mut targets = bb.targets().to_vec();
-                    println!("the address: {:x}; its targets: {:x?}", bb.address(), bb.targets());
-                    visited_clone.lock().unwrap().insert(bb.address());
-
-                    tx_clone.send(bb).unwrap();
-
-                    let mut adrs = addresses_clone.lock().unwrap();
-
-                    while let Some(target) = targets.pop() {
-                        println!("2");
-                        if !visited_clone.lock().unwrap().contains(&target) {
-                            adrs.push(target);
-                            // println!("the addresses to examine: {:x?}", adrs);
-                        }
-                    }
-
-                });
-                println!("{:x?}", addresses);
-            }
-            */
         });
-       
-        /*
-        for handle in handles {
-            handle.join().unwrap();
-        }
-        */
 
         let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
 
-        while let Ok(recieved) = rx.try_recv() {
+        while let Ok(recieved) = rblock.try_recv() {
             blocks.insert(recieved.address(), recieved);
         }
-
 
         let mut blocks: Vec<BasicBlock> = blocks.into_values().collect::<Vec<BasicBlock>>();
         blocks.sort();
