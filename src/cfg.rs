@@ -53,6 +53,14 @@ impl PartialOrd for BasicBlock {
 ///////////////////////////////////////////////////////////////
 
 impl BasicBlock {
+    fn new(address: u64, instructions: Vec<Instruction>, targets: Vec<u64>) -> Self {
+        BasicBlock {
+            address,
+            instructions,
+            targets,
+        }
+    }
+
     // given a binary instance it reads a basic block from the given virtual address
     // or if its not a valid virtual address, then from the closest(?) to that address
     fn from_address(binary: &Binary, va: u64) -> Self {
@@ -277,7 +285,9 @@ pub struct ControlFlowGraph {
 }
 
 impl ControlFlowGraph {
-    pub fn parallel_from_address(binary: &Binary, va: u64) -> Self {
+    // explore control flow graph using multiple threads
+    // but backtracking jumps to previous blocks are not cutting the target blocks
+    pub fn from_address_parallel_but_no_cut(binary: &Binary, va: u64) -> Self {
         // channel for building the graph:
         //          sblock: sending blocks
         //          rblock: recieving blocks
@@ -350,6 +360,132 @@ impl ControlFlowGraph {
         }
     }
 
+    // explore control flow graph using multiple threads (and cut blocks whenever there is an inbetween jump)
+    pub fn from_address_parallel(binary: &Binary, va: u64) -> Self {
+        // hashset of already explored blocks
+        let visited = Arc::new(Mutex::new(HashSet::<u64>::new()));
+
+        // channel for exploring the blocks:
+        //          saddr: sending address subject for exploration
+        //          raddr: recieving address subject for exploration
+        let (saddr, raddr) = mpsc::channel();
+
+        // the blocks are collected in a BTreeMap due to its fast searchability
+        let blocks = Arc::new(Mutex::new(BTreeMap::<u64, BasicBlock>::new()));
+
+        thread::scope(|s| {
+            // the entry address sent on the address channel to initialize
+            saddr.send(va).unwrap();
+
+            // we must iterate until there are active threads
+            // the number of active threads are counted with this atomicusize
+            let active_threads = Arc::new(AtomicUsize::new(1));
+
+            // while there are active threads -> we have blocks to explore
+            while active_threads.load(SeqCst) > 0 {
+                // println!("active threads: {}", active_threads.load(SeqCst));
+
+                if let Ok(address) = raddr.try_recv() {
+                    // clone the senders to move them inside the threads
+                    // let sblock_clone = sblock.clone();
+                    let saddr_clone = saddr.clone();
+
+                    // clone the auxiliary datas to use/modify them inside the threads
+                    let visited_clone = Arc::clone(&visited);
+                    let active_threads_clone = Arc::clone(&active_threads);
+
+                    // clone the blocks BTreeMap to move it to the spawned thread
+                    let blocks_clone = Arc::clone(&blocks);
+
+                    s.spawn(move || {
+                        // the current thread exploring the basic block: bb (send it on the graph build channel)
+                        // meanwhile the targets of this block is a subject of further exploration (send it on the exploration channel)
+                        let bb = BasicBlock::from_address(binary, address);
+                        let mut targets = bb.targets().to_vec();
+
+                        println!("new thread of block: {:x}", bb.address());
+                        println!("bb end: {:x}", bb.end_address());
+
+                        // the new block's address is uploaded to the already visited hashset
+                        visited_clone.lock().unwrap().insert(bb.address());
+
+                        // the BTreeMap of explored block is locked for use
+                        let mut blocks_lock = blocks_clone.lock().unwrap();
+                        // prior to the insert of bb into blocks we have to check if some of its parts
+                        // were already inserted in blocks or not -> if yes, then we only need to insert
+                        // bb's first "half"
+                        let cut = blocks_lock
+                            // the left boundary of the range must be exclusive - but still not get it WhY?
+                            .range((bb.address()+1)..bb.end_address())
+                            .next()
+                            .map(|(&x, _)| x);
+                        match cut {
+                            Some(addr) => {
+                                println!("the block: {:x} needs to be cut prior to insert at address: {:x}", bb.address(), addr);
+                                blocks_lock.insert(
+                                    bb.address(),
+                                    BasicBlock::new(
+                                        bb.address(),
+                                        bb.instructions()
+                                            .iter()
+                                            .filter(|&x| x.ip() < addr)
+                                            .copied()
+                                            .collect(),
+                                        vec![addr],
+                                    ),
+                                );
+                            }
+                            _ => {
+                                blocks_lock.insert(bb.address(), bb);
+                            }
+                        }
+
+                        while let Some(target) = targets.pop() {
+                            // when we are going through the targets, we need to check if any of them are
+                            // an inbetween instruction of some previous basci block - if yes, then we
+                            // we should cut that block
+                            let cut = blocks_lock.range(..target).next_back().map(|(&x, _)| x);
+
+                            match cut {
+                                Some(addr)
+                                    if target <= blocks_lock.get(&addr).unwrap().end_address() =>
+                                {
+                                    let tmp_block = blocks_lock.remove(&addr).unwrap();
+                                    let cut_blocks = tmp_block.cut_block(target);
+                                    for i in cut_blocks {
+                                        blocks_lock.insert(i.address(), i);
+                                    }
+                                }
+                                _ => {
+                                    if !visited_clone.lock().unwrap().contains(&target) {
+                                        // every not yet explored target address increases the number of active threads
+                                        active_threads_clone.fetch_add(1, SeqCst);
+                                        saddr_clone.send(target).unwrap();
+                                    }
+                                }
+                            }
+                        }
+                        // if we explored one block - the corresponding thread will be unactive
+                        active_threads_clone.fetch_sub(1, SeqCst);
+                    });
+                }
+            }
+        });
+
+        let mut blocks: Vec<BasicBlock> = blocks
+            .lock()
+            .unwrap()
+            .clone()
+            .into_values()
+            .collect::<Vec<BasicBlock>>();
+        blocks.sort();
+
+        ControlFlowGraph {
+            address: va,
+            blocks,
+        }
+    }
+
     // explore control flow graph from a given virtual address (using DFS)
     pub fn from_address(binary: &Binary, va: u64) -> Self {
         let mut blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
@@ -363,6 +499,8 @@ impl ControlFlowGraph {
             // is this clone too much?
             let mut targets = bb.targets().to_vec();
 
+            // TODO: it can happen that an inbetween block is read prior to the original
+            // parent block, hence we also need a conditional cut at insertion here
             blocks.insert(bb.address(), bb);
 
             while let Some(target) = targets.pop() {
