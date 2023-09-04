@@ -383,11 +383,8 @@ impl ControlFlowGraph {
 
             // while there are active threads -> we have blocks to explore
             while active_threads.load(SeqCst) > 0 {
-                // println!("active threads: {}", active_threads.load(SeqCst));
-
                 if let Ok(address) = raddr.try_recv() {
                     // clone the senders to move them inside the threads
-                    // let sblock_clone = sblock.clone();
                     let saddr_clone = saddr.clone();
 
                     // clone the auxiliary datas to use/modify them inside the threads
@@ -398,13 +395,10 @@ impl ControlFlowGraph {
                     let blocks_clone = Arc::clone(&blocks);
 
                     s.spawn(move || {
-                        // the current thread exploring the basic block: bb (send it on the graph build channel)
+                        // the current thread exploring the basic block: bb (insert it into the basic block BTreeMap)
                         // meanwhile the targets of this block is a subject of further exploration (send it on the exploration channel)
                         let bb = BasicBlock::from_address(binary, address);
                         let mut targets = bb.targets().to_vec();
-
-                        println!("new thread of block: {:x}", bb.address());
-                        println!("bb end: {:x}", bb.end_address());
 
                         // the new block's address is uploaded to the already visited hashset
                         visited_clone.lock().unwrap().insert(bb.address());
@@ -413,15 +407,20 @@ impl ControlFlowGraph {
                         let mut blocks_lock = blocks_clone.lock().unwrap();
                         // prior to the insert of bb into blocks we have to check if some of its parts
                         // were already inserted in blocks or not -> if yes, then we only need to insert
-                        // bb's first "half"
+                        // the basic block's first "half"
                         let cut = blocks_lock
-                            // the left boundary of the range must be exclusive - but still not get it WhY?
-                            .range((bb.address()+1)..bb.end_address())
+                            // since we are only interested in-between sub blocks that were already explored
+                            // the left boundary of the range must be exclusive
+                            .range((bb.address() + 1)..=bb.end_address())
+                            // moreover, starting from any in-between address, the instructions must
+                            // be the same as the original's -> it's enough to find the first of such
+                            // in-between instruction address
                             .next()
                             .map(|(&x, _)| x);
                         match cut {
                             Some(addr) => {
-                                println!("the block: {:x} needs to be cut prior to insert at address: {:x}", bb.address(), addr);
+                                // we have found such a previously explored sub-block, hence must cut the parent
+                                // block at this address into two and only insert the first half
                                 blocks_lock.insert(
                                     bb.address(),
                                     BasicBlock::new(
@@ -442,7 +441,7 @@ impl ControlFlowGraph {
 
                         while let Some(target) = targets.pop() {
                             // when we are going through the targets, we need to check if any of them are
-                            // an inbetween instruction of some previous basci block - if yes, then we
+                            // an inbetween instruction of some previous basic block - if yes, then we
                             // we should cut that block
                             let cut = blocks_lock.range(..target).next_back().map(|(&x, _)| x);
 
@@ -499,9 +498,33 @@ impl ControlFlowGraph {
             // is this clone too much?
             let mut targets = bb.targets().to_vec();
 
-            // TODO: it can happen that an inbetween block is read prior to the original
+            // blocks.insert(bb.address(), bb);
+            // it can happen that an inbetween block is read prior to the original
             // parent block, hence we also need a conditional cut at insertion here
-            blocks.insert(bb.address(), bb);
+            let cut = blocks
+                .range((bb.address() + 1)..=bb.end_address())
+                .next()
+                .map(|(&x, _)| x);
+
+            match cut {
+                Some(addr) => {
+                    blocks.insert(
+                        bb.address(),
+                        BasicBlock::new(
+                            bb.address(),
+                            bb.instructions()
+                                .iter()
+                                .filter(|&x| x.ip() < addr)
+                                .copied()
+                                .collect(),
+                            vec![addr],
+                        ),
+                    );
+                }
+                _ => {
+                    blocks.insert(bb.address(), bb);
+                }
+            }
 
             while let Some(target) = targets.pop() {
                 let cut = blocks.range(..target).next_back().map(|(&x, _)| x);
